@@ -3,6 +3,7 @@ package com.github.feng111627.idempotentwriteapijava.order;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
 
+import com.github.feng111627.idempotentwriteapijava.dependency.OrderDependencyGateway;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
@@ -18,11 +19,19 @@ public class OrderService {
     /** 模拟下游耗时（毫秒），默认 0；测试可用它放大并发竞争窗口 */
     private final long createDelayMs;
 
-    public OrderService(@Value("${order.create-delay-ms:0}") long createDelayMs) {
+    /** 下游依赖网关：下单前先确认依赖可用 */
+    private final OrderDependencyGateway dependencyGateway;
+
+    public OrderService(@Value("${order.create-delay-ms:0}") long createDelayMs,
+                        OrderDependencyGateway dependencyGateway) {
         this.createDelayMs = createDelayMs;
+        this.dependencyGateway = dependencyGateway;
     }
 
     public OrderResponse createOrder(OrderRequest request) {
+        // 依赖临时不可用时在此抛出 DependencyUnavailableException，
+        // 本次请求不算成功、不产生副作用，客户端可稍后重试
+        dependencyGateway.checkAvailable();
         if (createDelayMs > 0) {
             try {
                 Thread.sleep(createDelayMs);

@@ -37,6 +37,13 @@ public class IdempotencyService {
             new ConcurrentHashMap<>();
 
     /**
+     * 每个键首次见到时的内容指纹。与执行结果分开保存：
+     * 即使执行因临时故障失败、键被释放，指纹仍然保留，
+     * 因此故障期间同键不同内容的请求依然按冲突拒绝，而不会被当成新请求放行。
+     */
+    private final ConcurrentHashMap<String, String> fingerprints = new ConcurrentHashMap<>();
+
+    /**
      * 以幂等键执行操作。
      *
      * @param key         幂等键
@@ -46,6 +53,8 @@ public class IdempotencyService {
      */
     @SuppressWarnings("unchecked")
     public <T> IdempotentResult<T> execute(String key, String fingerprint, Supplier<T> operation) {
+        checkFingerprint(key, fingerprint);
+
         CompletableFuture<StoredResult> newFuture = new CompletableFuture<>();
         CompletableFuture<StoredResult> existing = store.putIfAbsent(key, newFuture);
 
@@ -56,9 +65,10 @@ public class IdempotencyService {
                 newFuture.complete(new StoredResult(fingerprint, value));
                 return new IdempotentResult<>(value, false);
             } catch (RuntimeException e) {
-                // 执行失败：释放键，允许客户端修正后重试
-                store.remove(key, newFuture);
+                // 执行失败：先让等待者拿到失败结论，再释放键，允许客户端稍后重试。
+                // 键不会被失败占死，但内容指纹保留（见 fingerprints）。
                 newFuture.completeExceptionally(e);
+                store.remove(key, newFuture);
                 throw e;
             }
         }
@@ -70,6 +80,15 @@ public class IdempotencyService {
                     "幂等键已被使用，但请求内容不一致");
         }
         return new IdempotentResult<>((T) stored.value(), true);
+    }
+
+    /** 同键不同内容一律拒绝，无论当前是否有执行在进行、或之前是否失败过 */
+    private void checkFingerprint(String key, String fingerprint) {
+        String seen = fingerprints.putIfAbsent(key, fingerprint);
+        if (seen != null && !seen.equals(fingerprint)) {
+            throw new ApiException(ErrorCode.IDEMPOTENCY_KEY_CONFLICT, HttpStatus.CONFLICT,
+                    "幂等键已被使用，但请求内容不一致");
+        }
     }
 
     private StoredResult await(String key, CompletableFuture<StoredResult> future) {

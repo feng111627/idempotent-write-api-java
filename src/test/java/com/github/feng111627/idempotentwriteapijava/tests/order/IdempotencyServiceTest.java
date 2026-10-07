@@ -64,6 +64,29 @@ class IdempotencyServiceTest {
     }
 
     @Test
+    @DisplayName("失败后指纹保留：同键不同内容仍按冲突拒绝，同内容可重试")
+    void fingerprintRetainedAfterFailure() {
+        // 第一次执行失败，键被释放
+        assertThatThrownBy(() -> service.execute("k", "fp-1", () -> {
+            throw new IllegalStateException("下游故障");
+        })).isInstanceOf(IllegalStateException.class);
+
+        // 故障后同键不同内容：仍按冲突拒绝，而不是当成新请求放行
+        assertThatThrownBy(() -> service.execute("k", "fp-2", () -> "sneaky"))
+                .isInstanceOfSatisfying(ApiException.class, e -> {
+                    log.info("[失败后冲突] 错误码={}, 消息={}", e.getCode(), e.getMessage());
+                    assertThat(e.getCode()).isEqualTo(ErrorCode.IDEMPOTENCY_KEY_CONFLICT);
+                });
+
+        // 同内容重试：正常执行成功
+        IdempotentResult<String> retry = service.execute("k", "fp-1", () -> "recovered");
+        log.info("[失败后冲突] 同内容重试结果={}, replayed={}", retry.value(), retry.replayed());
+        assertThat(retry.value()).isEqualTo("recovered");
+        assertThat(retry.replayed()).isFalse();
+        log.info("[失败后冲突] 通过：失败后指纹保留，冲突仍拒绝、同内容可重试");
+    }
+
+    @Test
     @DisplayName("并发等待：同键并发请求等待首个结果而非重复执行")
     void concurrentCallsWaitForFirstResult() throws Exception {
         ExecutorService pool = Executors.newFixedThreadPool(2);
