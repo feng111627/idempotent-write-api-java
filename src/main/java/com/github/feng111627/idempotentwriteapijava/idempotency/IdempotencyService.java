@@ -18,6 +18,11 @@ import org.springframework.stereotype.Service;
  * <p>并发保证：以 {@link ConcurrentHashMap#putIfAbsent} 抢占键的所有权，
  * 抢到所有权的线程执行真实操作，其余线程等待同一个 future，
  * 因此副作用只会发生一次，且所有并发请求拿到同一份结果。
+ *
+ * <p>失败语义：执行失败（含依赖临时不可用）时立即释放键，不把键占死，
+ * 客户端可用同一键、同一内容安全重试；指纹在抢占键时就登记，
+ * 因此即使首个请求还在执行或刚刚失败，同键不同内容的请求也会被
+ * 按冲突拒绝，而不会被当成新请求放行。
  */
 @Service
 public class IdempotencyService {
@@ -29,12 +34,11 @@ public class IdempotencyService {
     public record IdempotentResult<T>(T value, boolean replayed) {
     }
 
-    /** 键下已存储的结果：内容指纹 + 业务返回值 */
-    private record StoredResult(String fingerprint, Object value) {
+    /** 键的在途记录：抢占键时即登记内容指纹，future 承载最终业务结果 */
+    private record InFlight(String fingerprint, CompletableFuture<Object> future) {
     }
 
-    private final ConcurrentHashMap<String, CompletableFuture<StoredResult>> store =
-            new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, InFlight> store = new ConcurrentHashMap<>();
 
     /**
      * 以幂等键执行操作。
@@ -46,33 +50,35 @@ public class IdempotencyService {
      */
     @SuppressWarnings("unchecked")
     public <T> IdempotentResult<T> execute(String key, String fingerprint, Supplier<T> operation) {
-        CompletableFuture<StoredResult> newFuture = new CompletableFuture<>();
-        CompletableFuture<StoredResult> existing = store.putIfAbsent(key, newFuture);
+        InFlight inFlight = new InFlight(fingerprint, new CompletableFuture<>());
+        InFlight existing = store.putIfAbsent(key, inFlight);
 
         if (existing == null) {
             // 抢到键的所有权：执行真实操作
             try {
                 T value = operation.get();
-                newFuture.complete(new StoredResult(fingerprint, value));
+                inFlight.future().complete(value);
                 return new IdempotentResult<>(value, false);
             } catch (RuntimeException e) {
-                // 执行失败：释放键，允许客户端修正后重试
-                store.remove(key, newFuture);
-                newFuture.completeExceptionally(e);
+                // 执行失败：释放键，允许客户端以同键同内容重试
+                store.remove(key, inFlight);
+                inFlight.future().completeExceptionally(e);
                 throw e;
             }
         }
 
-        // 未抢到：等待首个请求的结果
-        StoredResult stored = await(key, existing);
-        if (!stored.fingerprint().equals(fingerprint)) {
+        // 未抢到：先比对指纹。无论首个请求进行中、已成功还是刚失败，
+        // 同键不同内容都按冲突拒绝，绝不当成新请求放行。
+        if (!existing.fingerprint().equals(fingerprint)) {
             throw new ApiException(ErrorCode.IDEMPOTENCY_KEY_CONFLICT, HttpStatus.CONFLICT,
                     "幂等键已被使用，但请求内容不一致");
         }
-        return new IdempotentResult<>((T) stored.value(), true);
+
+        // 内容一致：等待首个请求的结果，拿到与其一致的结论
+        return new IdempotentResult<>((T) await(existing.future()), true);
     }
 
-    private StoredResult await(String key, CompletableFuture<StoredResult> future) {
+    private Object await(CompletableFuture<Object> future) {
         try {
             return future.get(WAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         } catch (TimeoutException e) {
@@ -83,12 +89,13 @@ public class IdempotencyService {
             throw new ApiException(ErrorCode.SERVICE_UNAVAILABLE, HttpStatus.SERVICE_UNAVAILABLE,
                     "服务暂时繁忙，请稍后重试");
         } catch (ExecutionException e) {
-            // 首个请求执行失败：键已被释放，提示客户端重试
+            // 首个请求执行失败：键已被释放。与首个请求保持一致的对外结论：
+            // 业务异常（如依赖临时不可用）原样传递，其余按内部错误处理。
             if (e.getCause() instanceof ApiException apiException) {
                 throw apiException;
             }
-            throw new ApiException(ErrorCode.SERVICE_UNAVAILABLE, HttpStatus.SERVICE_UNAVAILABLE,
-                    "服务暂时繁忙，请稍后重试");
+            throw new ApiException(ErrorCode.INTERNAL_ERROR, HttpStatus.INTERNAL_SERVER_ERROR,
+                    "服务内部错误");
         }
     }
 }

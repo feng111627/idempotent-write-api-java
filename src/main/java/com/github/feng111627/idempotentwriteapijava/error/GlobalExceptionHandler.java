@@ -22,7 +22,8 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(ApiException.class)
     public ResponseEntity<ErrorResponse> handleApiException(ApiException ex) {
         return ResponseEntity.status(ex.getStatus())
-                .body(ErrorResponse.of(ex.getCode(), ex.getMessage()));
+                .body(ErrorResponse.of(ex.getCode(), ex.getMessage(),
+                        ex.getCode() == ErrorCode.SERVICE_UNAVAILABLE));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
@@ -31,13 +32,13 @@ public class GlobalExceptionHandler {
                 .map(fe -> fe.getField() + ": " + fe.getDefaultMessage())
                 .collect(Collectors.joining("; "));
         return ResponseEntity.badRequest()
-                .body(ErrorResponse.of(ErrorCode.VALIDATION_ERROR, "请求参数不合法: " + detail));
+                .body(ErrorResponse.of(ErrorCode.VALIDATION_ERROR, "请求参数不合法: " + detail, false));
     }
 
     @ExceptionHandler(HttpMessageNotReadableException.class)
     public ResponseEntity<ErrorResponse> handleNotReadable(HttpMessageNotReadableException ex) {
         return ResponseEntity.badRequest()
-                .body(ErrorResponse.of(ErrorCode.VALIDATION_ERROR, "请求体无法解析"));
+                .body(ErrorResponse.of(ErrorCode.VALIDATION_ERROR, "请求体无法解析", false));
     }
 
     @ExceptionHandler(Exception.class)
@@ -45,6 +46,6 @@ public class GlobalExceptionHandler {
         // 内部细节只记日志，不返回给客户端
         log.error("未预期的内部错误", ex);
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                .body(ErrorResponse.of(ErrorCode.INTERNAL_ERROR, "服务内部错误"));
+                .body(ErrorResponse.of(ErrorCode.INTERNAL_ERROR, "服务内部错误", false));
     }
 }
